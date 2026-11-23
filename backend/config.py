@@ -11,6 +11,11 @@ load_dotenv(ROOT / '.env')
 @dataclass
 class Settings:
     data_dir: Path = field(default_factory=lambda: Path(os.getenv('GUIDELY_DATA_DIR', str(ROOT / 'runtime'))).resolve())
+    database_url: str = field(default_factory=lambda: os.getenv('DATABASE_URL', ''), repr=False)
+    supabase_url: str = field(default_factory=lambda: os.getenv('SUPABASE_URL', '').rstrip('/'))
+    supabase_key: str = field(default_factory=lambda: os.getenv('SUPABASE_SERVICE_ROLE_KEY', ''), repr=False)
+    storage_bucket: str = field(default_factory=lambda: os.getenv('SUPABASE_STORAGE_BUCKET', 'guidely-documents'))
+    test_mode: bool = field(default_factory=lambda: os.getenv('GUIDELY_TEST_MODE', 'false').lower() == 'true')
     api_key: str = field(default='', repr=False)
     embedding_model: str = ''
     chat_model: str = ''
@@ -19,6 +24,12 @@ class Settings:
     cookie_secure: bool = field(default_factory=lambda: os.getenv('GUIDELY_COOKIE_SECURE', 'false').lower() == 'true')
 
     def __post_init__(self):
+        if self.provider == 'fake':
+            self.test_mode = True
+        if os.getenv('VERCEL'):
+            if self.test_mode or self.provider != 'gemini':
+                raise RuntimeError('Production requires Gemini and remote storage.')
+            self.cookie_secure = True
         prefix = 'GEMINI' if self.provider == 'gemini' else 'OPENAI'
         self.api_key = self.api_key or os.getenv(prefix + '_API_KEY', '')
         self.embedding_model = self.embedding_model or os.getenv(prefix + '_EMBEDDING_MODEL', 'gemini-embedding-001' if self.provider == 'gemini' else 'text-embedding-3-small')

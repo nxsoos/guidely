@@ -7,7 +7,14 @@ from typing import Protocol
 
 import httpx
 
-from openai import OpenAI, APIError, APITimeoutError, AuthenticationError, RateLimitError
+try:
+    from openai import OpenAI, APIError, APITimeoutError, AuthenticationError, RateLimitError
+except ImportError:
+    OpenAI = None
+    class APIError(Exception): pass
+    class APITimeoutError(APIError): pass
+    class AuthenticationError(APIError): pass
+    class RateLimitError(APIError): pass
 
 from .errors import AppError
 from .citations import citations_valid
@@ -137,7 +144,7 @@ class GeminiProvider:
         model = self.settings.embedding_model
         # Standard synchronous batching, not the separate paid asynchronous Batch API.
         result = self.request(model, 'batchEmbedContents', {'requests': [
-            {'model': 'models/' + model, 'content': {'parts': [{'text': text}]}}
+            {'model': 'models/' + model, 'content': {'parts': [{'text': text}]}, 'outputDimensionality': 768}
             for text in texts]})
         try:
             vectors = [item['values'] for item in result['embeddings']]
@@ -145,7 +152,12 @@ class GeminiProvider:
                 raise ValueError('invalid vectors')
             if len({len(v) for v in vectors}) != 1:
                 raise ValueError('inconsistent dimensions')
-            return vectors
+            if any(len(v) != 768 for v in vectors):
+                raise ValueError('expected 768 dimensions')
+            norms = [math.sqrt(sum(n*n for n in v)) for v in vectors]
+            if any(n == 0 for n in norms):
+                raise ValueError('zero vector')
+            return [[n / norm for n in v] for v, norm in zip(vectors, norms)]
         except (KeyError, TypeError, ValueError):
             raise AppError(502, 'invalid_embeddings', 'Gemini returned invalid or incomplete embeddings.') from None
 

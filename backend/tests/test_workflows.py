@@ -33,7 +33,6 @@ def test_full_pipeline_and_caches(client):
     assert counters['question_cache_hits'] == 5
     assert counters['document_embeddings_generated'] == generated
     client.post(f"/api/documents/{doc['id']}/index")
-    client.app.state.service.jobs.join()
     assert client.get('/metrics').json()['counters']['unchanged_documents_skipped'] == 1
     followup = client.post('/api/questions', json={'question': 'How do I request it?', 'conversation_id': result['conversation_id']})
     assert followup.status_code == 200
@@ -47,7 +46,6 @@ def test_edit_removes_stale_search_and_replaces_chunks(client):
     assert changed.json()['state'] == 'changed'
     assert client.post('/api/search', json={'question': 'leave'}).status_code == 404
     client.post(f"/api/documents/{doc['id']}/index")
-    client.app.state.service.jobs.join()
     result = client.post('/api/search', json={'question': 'leave', 'tags': ['people'], 'category': 'HR'}).json()
     assert '30 leave days' in result['passages'][0]['snippet']
     assert client.post('/api/search', json={'question': 'leave', 'category': 'IT'}).status_code == 404
@@ -167,12 +165,11 @@ def test_accounts_and_sessions(client):
 
 
 def test_chunk_size_overlap_and_headings():
-    import tiktoken
-    encoding = tiktoken.get_encoding('cl100k_base')
     parts = chunks('# Policy\n' + 'A word about leave. ' * 500)
     assert len(parts) > 1
-    assert all(len(encoding.encode(p['snippet'])) <= 700 for p in parts)
+    assert all(len(p['snippet']) <= 2800 for p in parts)
     assert all(p['section'] == 'Policy' for p in parts)
+    assert parts[0]['snippet'][-100:] in parts[1]['snippet']
 
 
 def test_persistence_and_interrupted_job_recovery(client, settings):
@@ -183,9 +180,12 @@ def test_persistence_and_interrupted_job_recovery(client, settings):
     another = create_app(settings)
     with TestClient(another, headers={'X-Guidely': '1'}) as restarted:
         restarted.post('/api/auth/login', json={'username': 'admin', 'password': 'test-password-123'})
-        another.state.service.jobs.join()
-        assert restarted.get('/api/index-jobs/recover').json()['state'] == 'complete'
+        assert restarted.get('/api/index-jobs/recover').json()['state'] == 'indexing'
+        assert restarted.post(f"/api/documents/{doc['id']}/index").json()['state'] == 'complete'
+        assert restarted.get('/api/index-jobs/recover').json()['state'] == 'failed'
         assert restarted.get('/api/conversations/' + result['conversation_id']).status_code == 200
+        original = restarted.get(f"/api/documents/{doc['id']}/original")
+        assert original.status_code == 200 and b'25 annual leave days' in original.content
         assert restarted.post('/api/search', json={'question': 'leave days'}).status_code == 200
         assert restarted.get('/metrics').json()['chunks'] >= 1
 
@@ -198,35 +198,19 @@ def test_indexing_failure_and_retry(client):
     service = client.app.state.service
     service.provider = Broken()
     first = client.post(f"/api/documents/{doc['id']}/index").json()
-    service.jobs.join()
     assert client.get('/api/index-jobs/' + first['id']).json()['state'] == 'failed'
     assert client.get(f"/api/documents/{doc['id']}").json()['state'] == 'failed'
     service.provider = FakeProvider()
     second = client.post(f"/api/documents/{doc['id']}/index").json()
-    service.jobs.join()
     assert client.get('/api/index-jobs/' + second['id']).json()['state'] == 'complete'
 
 
-def test_active_indexing_conflicts(client):
-    import threading
-    started, finish = threading.Event(), threading.Event()
-    class Slow(FakeProvider):
-        def embed(self, texts):
-            started.set()
-            assert finish.wait(10)
-            return super().embed(texts)
-    service = client.app.state.service
-    service.provider = Slow()
+def test_index_is_request_bound(client):
     doc = client.post('/api/documents', files={'file': ('policy.txt', b'Annual leave is 25 days.')}).json()
-    first = client.post(f"/api/documents/{doc['id']}/index")
-    assert first.status_code == 202
-    try:
-        assert started.wait(5)
-        assert client.post(f"/api/documents/{doc['id']}/index").status_code == 409
-        assert client.patch(f"/api/documents/{doc['id']}", json={'text': 'new policy'}).status_code == 409
-    finally:
-        finish.set()
-        service.jobs.join()
+    response = client.post(f"/api/documents/{doc['id']}/index")
+    assert response.status_code == 202
+    assert response.json()['state'] == 'complete'
+    assert client.app.state.service.collection.count() == 1
 
 
 def test_reindexed_source_during_generation_is_rejected(client):

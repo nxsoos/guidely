@@ -4,7 +4,7 @@ from getpass import getpass
 
 from .auth import create_user, hash_password
 from .config import Settings
-from .db import Database
+from .db import database
 
 
 def main():
@@ -17,7 +17,7 @@ def main():
         parser.error('Passwords do not match.')
     if not 10 <= len(password) <= 128:
         parser.error('Passwords must contain 10–128 characters.')
-    db = Database(Settings().data_dir)
+    db = database(Settings())
     if args.command == 'create-admin':
         create_user(db, args.username, password, 'admin')
     else:

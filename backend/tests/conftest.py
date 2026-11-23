@@ -26,6 +26,5 @@ def upload_index(client, text='# Leave\nEmployees receive 25 annual leave days. 
     assert response.status_code == 201, response.text
     doc = response.json()
     job = client.post(f"/api/documents/{doc['id']}/index").json()
-    client.app.state.service.jobs.join()
     assert client.get(f"/api/index-jobs/{job['id']}").json()['state'] == 'complete'
     return doc

@@ -14,7 +14,7 @@ from .conftest import upload_index
 
 
 def gemini(tmp_path, handler):
-    settings = Settings(data_dir=tmp_path, provider='gemini', api_key='gemini-test-secret',
+    settings = Settings(data_dir=tmp_path, test_mode=True, provider='gemini', api_key='gemini-test-secret',
                         embedding_model='gemini-embedding-001', chat_model='gemini-2.5-flash-lite', min_similarity=0)
     return settings, GeminiProvider(settings, transport=httpx.MockTransport(handler))
 
@@ -32,9 +32,9 @@ def test_gemini_embedding_batch_wire_format(tmp_path):
         payload = json.loads(request.content)
         assert [r['content']['parts'][0]['text'] for r in payload['requests']] == ['one', 'two']
         assert all(r['model'] == 'models/gemini-embedding-001' for r in payload['requests'])
-        return httpx.Response(200, json={'embeddings': [{'values': [1, 0]}, {'values': [0, 1]}]})
+        return httpx.Response(200, json={'embeddings': [{'values': [1, 0] + [0]*766}, {'values': [0, 1] + [0]*766}]})
     _, provider = gemini(tmp_path, handler)
-    assert provider.embed(['one', 'two']) == [[1, 0], [0, 1]]
+    assert provider.embed(['one', 'two']) == [[1, 0] + [0]*766, [0, 1] + [0]*766]
     assert provider.embed([]) == []
 
 
@@ -142,7 +142,7 @@ def test_gemini_full_api_workflow(tmp_path):
     def handler(request):
         payload = json.loads(request.content)
         if request.url.path.endswith(':batchEmbedContents'):
-            return httpx.Response(200, json={'embeddings': [{'values': [1.0, 0.0]} for _ in payload['requests']]})
+            return httpx.Response(200, json={'embeddings': [{'values': [1.0, 0.0] + [0.0]*766} for _ in payload['requests']]})
         if 'responseMimeType' in payload['generationConfig']:
             return httpx.Response(200, json=result(json.dumps({'answer': '25 days [1]', 'source_ids': ['1'], 'supported': True})))
         return httpx.Response(200, json=result('How many leave days?'))
@@ -161,7 +161,7 @@ def test_gemini_full_api_workflow(tmp_path):
         assert followup.status_code == 200
         assert client.post('/api/questions', json={'question': 'leave days'}).status_code == 200
         assert client.get('/metrics').json()['counters']['question_cache_hits'] >= 1
-    other_settings = Settings(data_dir=tmp_path, provider='openai', api_key='test-only', min_similarity=0)
+    other_settings = Settings(data_dir=tmp_path, test_mode=True, provider='openai', api_key='test-only', min_similarity=0)
     other = Service(other_settings)
     assert other.collection.name != app.state.service.collection.name
     assert other.collection.count() == 0

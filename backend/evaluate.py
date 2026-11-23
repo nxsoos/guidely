@@ -1,7 +1,7 @@
 """Run a reproducible quality/latency experiment, then prepare a human review sheet.
 
 Uses an isolated dataset under runtime/evaluations; never modifies uploaded user docs.
-Live mode makes paid API requests. Fake mode is only a pipeline smoke test.
+Live evaluation is disabled for this portfolio deployment. Fake mode is an offline pipeline smoke test.
 """
 import argparse
 import csv
@@ -34,13 +34,9 @@ def main():
             values = [r[field].strip().lower() for r in rows if r[field].strip().lower() in ('yes', 'no')]
             print(f'{field}: {values.count("yes")}/{len(values)} reviewed' + (f' ({100*values.count("yes")/len(values):.1f}%)' if values else ''))
         return
-    settings = Settings()
-    if not args.fake and not settings.api_key:
-        parser.error(f'Set {settings.key_variable} in .env before live evaluation, or use --fake for an offline smoke test.')
-    if args.fake:
-        settings.provider = 'fake'
-    elif settings.provider == 'fake':
-        parser.error('Choose gemini or openai in GUIDELY_PROVIDER for a live evaluation, or pass --fake.')
+    if not args.fake:
+        parser.error('Live bulk evaluation is disabled to protect the deployment database and Gemini quota. Use --fake for an isolated offline smoke test, or --review for existing review sheets.')
+    settings = Settings(provider='fake', test_mode=True)
     settings.data_dir = settings.data_dir / 'evaluations' / uid()
     service = Service(settings)
     user = create_user(service.db, 'evaluator', uid(), 'admin')
@@ -50,11 +46,10 @@ def main():
         for path in sorted((ROOT / 'data' / 'sample-docs').glob('*.md')):
             doc_id = uid()
             content = path.read_bytes()
-            (service.uploads / doc_id).write_bytes(content)
-            service.db.execute('INSERT INTO documents(id,filename,text,state,created_at) VALUES (?,?,?,?,?)',
-                               (doc_id, path.name, extract(path.name, content), 'pending', now()))
+            service.storage.write_test(doc_id, content)
+            service.db.execute('INSERT INTO documents(id,filename,text,state,created_at,object_key) VALUES (?,?,?,?,?,?)',
+                               (doc_id, path.name, extract(path.name, content), 'pending', now(), doc_id))
             service.enqueue(doc_id)
-        service.jobs.join()
         failed = service.db.all("SELECT * FROM jobs WHERE state='failed'")
         if failed:
             raise RuntimeError('Sample indexing failed: ' + failed[0]['error'])

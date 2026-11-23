@@ -7,10 +7,16 @@ export default function Documents({
   docs,
   refresh,
   admin,
+  loading,
+  loaded,
+  loadError,
 }: {
   docs: Doc[];
-  refresh: () => Promise<void>;
+  refresh: (forceFresh?: boolean) => Promise<void>;
   admin: boolean;
+  loading: boolean;
+  loaded: boolean;
+  loadError: string;
 }) {
   const [selected, setSelected] = useState<Doc | null>(null);
   const [text, setText] = useState("");
@@ -19,59 +25,48 @@ export default function Documents({
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
-  const [jobs, setJobs] = useState<Record<string, string>>({});
+  const [indexing, setIndexing] = useState<Record<string, boolean>>({});
+  const pendingIndexes = useRef(new Set<string>());
+  const [uploadStage, setUploadStage] = useState("");
   const fileInput = useRef<HTMLInputElement>(null);
-  useEffect(() => {
-    if (!Object.keys(jobs).length) return;
-    const interval = window.setInterval(async () => {
-      for (const [docId, jobId] of Object.entries(jobs)) {
-        try {
-          const job = await api<{ state: string; error?: string }>(
-            `/api/index-jobs/${jobId}`,
-          );
-          if (["complete", "failed"].includes(job.state)) {
-            setJobs((previous) => {
-              const next = { ...previous };
-              delete next[docId];
-              return next;
-            });
-            if (job.state === "failed")
-              setError(job.error || "Indexing failed.");
-            else
-              setMessage(
-                "Indexing complete. Your document is ready for questions.",
-              );
-            await refresh();
-          }
-        } catch (e) {
-          setError(errorText(e));
-        }
-      }
-    }, 1200);
-    return () => window.clearInterval(interval);
-  }, [jobs, refresh]);
-  // Also refresh persisted jobs after navigation or a browser reload.
+  // Fetch again after a reload while a persisted operation may still be running.
+  // Chained timeouts and App's shared request prevent overlapping slow requests.
   useEffect(() => {
     if (!docs.some((d) => d.state === "indexing")) return;
-    const timer = window.setInterval(() => {
-      void refresh().catch((e) => setError(errorText(e)));
-    }, 2000);
-    return () => window.clearInterval(timer);
+    let cancelled = false;
+    let timer: number;
+    const poll = async () => {
+      try { await refresh(); }
+      catch (e) { if (!cancelled) setError(errorText(e)); }
+      if (!cancelled) timer = window.setTimeout(poll, 3000);
+    };
+    timer = window.setTimeout(poll, 3000);
+    return () => { cancelled = true; window.clearTimeout(timer); };
   }, [docs, refresh]);
   async function upload(file: File) {
     setBusy(true);
     setError("");
     setMessage("");
+    setUploadStage("Preparing upload...");
     try {
-      const form = new FormData();
-      form.append("file", file);
-      await api<Doc>("/api/documents", { method: "POST", body: form });
-      await refresh();
+      if (file.size > 1024 * 1024) throw new Error("Files must be 1 MB or smaller.");
+      const intent = await api<{ id: string; upload_url: string }>("/api/uploads", {
+        method: "POST", body: body({ filename: file.name, size: file.size }),
+      });
+      setUploadStage("Uploading file...");
+      const uploaded = await fetch(intent.upload_url, {
+        method: "PUT", body: file, headers: { "Content-Type": file.type || "application/octet-stream", ...(intent.upload_url.startsWith("/") ? { "X-Guidely": "1" } : {}) },
+      });
+      if (!uploaded.ok) throw new Error("Storage upload failed. Please try again.");
+      setUploadStage("Validating document...");
+      await api<Doc>(`/api/uploads/${intent.id}/complete`, { method: "POST" });
+      await refresh(true);
       setMessage("Document uploaded. Select Index to make it searchable.");
     } catch (e) {
       setError(errorText(e));
     } finally {
       setBusy(false);
+      setUploadStage("");
       if (fileInput.current) fileInput.current.value = "";
     }
   }
@@ -108,7 +103,7 @@ export default function Documents({
         }),
       });
       setSelected(null);
-      await refresh();
+      await refresh(true);
       setMessage(
         "Saved. Re-index changed text before asking questions about it.",
       );
@@ -119,16 +114,24 @@ export default function Documents({
     }
   }
   async function index(doc: Doc) {
+    if (pendingIndexes.current.has(doc.id)) return;
+    pendingIndexes.current.add(doc.id);
+    setIndexing((previous) => ({ ...previous, [doc.id]: true }));
     setError("");
-    setMessage("");
+    setMessage("Indexing your document. You can keep this page open while it finishes.");
     try {
-      const job = await api<{ id: string }>(`/api/documents/${doc.id}/index`, {
+      const job = await api<{ id: string; state: string; error?: string }>(`/api/documents/${doc.id}/index`, {
         method: "POST",
       });
-      setJobs((previous) => ({ ...previous, [doc.id]: job.id }));
-      await refresh();
+      if (job.state === "failed") setError(job.error || "Indexing failed. You can retry.");
+      setMessage(job.state === "complete" ? "Indexing complete. Your document is ready for questions." : "");
+      await refresh(true);
     } catch (e) {
+      setMessage("");
       setError(errorText(e));
+    } finally {
+      pendingIndexes.current.delete(doc.id);
+      setIndexing((previous) => { const next = { ...previous }; delete next[doc.id]; return next; });
     }
   }
   return (
@@ -138,12 +141,15 @@ export default function Documents({
           <span className="eyebrow">THE SOURCE OF YOUR ANSWERS</span>
           <h1>Document library</h1>
         </div>
-        <span className="count-pill">{docs.length} documents</span>
+        <span className="count-pill">{loaded ? `${docs.length} ${docs.length === 1 ? "document" : "documents"}` : !loadError ? "Loading..." : "Unavailable"}</span>
       </div>
       <p className="page-description">
         A shared home for your team's policies, guides, and everyday know-how.
       </p>
-      <Notice error={error} message={message} />
+      <Notice error={error || loadError} message={message} />
+      {loadError && <button disabled={loading} onClick={() => void refresh().catch(() => {})}>Retry loading documents</button>}
+      {uploadStage && <p role="status">{uploadStage}</p>}
+      {(loading || (!loaded && !loadError)) && <p role="status">{loaded ? "Refreshing documents..." : "Loading documents..."}</p>}
       {admin && (
         <div className="upload-card">
           <span className="upload-icon">
@@ -151,10 +157,10 @@ export default function Documents({
           </span>
           <div>
             <h2>Add to your team's knowledge</h2>
-            <p>TXT, Markdown, or text-based PDF · Up to 10 MB</p>
+            <p>TXT, Markdown, or text-based PDF · Up to 1 MB; 10 PDF pages; 24,000 characters</p>
           </div>
           <label className={`button primary ${busy ? "disabled" : ""}`}>
-            {busy ? "Working…" : "Upload document +"}
+            {busy ? uploadStage || "Working..." : "Upload document +"}
             <input
               ref={fileInput}
               type="file"
@@ -169,8 +175,16 @@ export default function Documents({
           </label>
         </div>
       )}
+      {admin && <button disabled={busy} onClick={async () => {
+        setBusy(true); setError("");
+        try {
+          const result = await api<{ removed: number }>("/api/uploads/cleanup", { method: "POST" });
+          setMessage(`Removed ${result.removed} expired uploads.`);
+        } catch (e) { setError(errorText(e)); }
+        finally { setBusy(false); }
+      }}>Clean up expired uploads</button>}
       <div className="document-list">
-        {!docs.length && (
+        {loaded && !loading && !loadError && !docs.length && (
           <div className="empty-state">
             No documents yet.{" "}
             {admin
@@ -195,22 +209,29 @@ export default function Documents({
               </div>
               {doc.error && <p className="inline-error">{doc.error}</p>}
             </div>
-            <span className={`status ${jobs[doc.id] ? "indexing" : doc.state}`}>
-              {jobs[doc.id] ? "indexing" : doc.state}
+            <span className={`status ${indexing[doc.id] ? "indexing" : doc.state}`}>
+              {indexing[doc.id] ? "indexing" : doc.state}
             </span>
             <div className="row-actions">
               <button
-                disabled={busy || (!admin && doc.state !== "ready")}
+                disabled={busy || doc.state === "deleting" || (!admin && doc.state !== "ready")}
                 onClick={() => void open(doc)}
               >
                 {admin ? "Edit" : "View"}
               </button>
+              {admin && <button disabled={busy} onClick={async () => {
+                if (!window.confirm(`Delete ${doc.filename}?`)) return;
+                setBusy(true);
+                try { await api(`/api/documents/${doc.id}`, { method: "DELETE" }); await refresh(true); }
+                catch (e) { setError(errorText(e)); }
+                finally { setBusy(false); }
+              }}>{doc.state === "deleting" ? "Retry delete" : "Delete"}</button>}
               {admin && (
                 <button
-                  disabled={!!jobs[doc.id] || doc.state === "indexing"}
+                  disabled={!!indexing[doc.id] || doc.state === "deleting"}
                   onClick={() => void index(doc)}
                 >
-                  {doc.state === "ready" ? "Re-index" : "Index"}
+                  {indexing[doc.id] ? "Indexing..." : doc.state === "ready" ? "Re-index" : "Index"}
                 </button>
               )}
             </div>

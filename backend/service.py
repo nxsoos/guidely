@@ -2,14 +2,11 @@ import hashlib
 import json
 import logging
 import math
-import queue
-import threading
 import time
 
-import chromadb
-from chromadb.config import Settings as ChromaSettings
-
-from .db import Database, now, uid
+from .db import database, now, uid
+from .vectors import VectorCollection
+from .storage import Storage
 from .documents import chunks
 from .errors import AppError
 from .citations import citations_valid
@@ -21,95 +18,81 @@ log = logging.getLogger('guidely')
 class Service:
     def __init__(self, settings, provider=None):
         self.settings = settings
-        self.db = Database(settings.data_dir)
-        self.uploads = settings.data_dir / 'uploads'
-        self.uploads.mkdir(exist_ok=True)
+        self.db = database(settings)
+        self.storage = Storage(settings)
         providers = {'fake': FakeProvider, 'openai': OpenAIProvider, 'gemini': GeminiProvider}
         if settings.provider not in providers:
             raise ValueError('GUIDELY_PROVIDER must be gemini, openai, or fake')
+        if not settings.test_mode and (settings.provider != 'gemini' or settings.embedding_model != 'gemini-embedding-001'):
+            raise ValueError('Deployment requires gemini-embedding-001 with 768 dimensions.')
         self.provider = provider or (FakeProvider() if settings.provider == 'fake' else providers[settings.provider](settings))
-        self.model_key = settings.provider + ':' + settings.embedding_model
-        self.client = chromadb.PersistentClient(path=str(settings.data_dir / 'chroma'),
-                                                settings=ChromaSettings(anonymized_telemetry=False))
-        self.collection = self.client.get_or_create_collection(
-            name='chunks-' + hashlib.sha256(self.model_key.encode()).hexdigest()[:16],
-            metadata={'hnsw:space': 'cosine'})
-        self.lock = threading.RLock()
-        self.jobs = queue.Queue()
-        self.worker = None
-        self.db.execute("UPDATE jobs SET state='queued' WHERE state='indexing'")
+        self.model_key = settings.provider + ':' + settings.embedding_model + ':768:char-v2'
+        self.collection = VectorCollection(self.db, self.model_key, settings.test_mode)
+        self.lock = self.db.lock
 
     def start(self):
-        self.worker = threading.Thread(target=self.run_worker, name='guidely-indexer', daemon=True)
-        self.worker.start()
-        for job in self.db.all("SELECT id FROM jobs WHERE state='queued' ORDER BY created_at"):
-            self.jobs.put(job['id'])
+        pass
 
     def stop(self):
-        self.jobs.put(None)
-        if self.worker:
-            self.worker.join()  # finish active work before shutting down the single process
+        pass
 
     def document(self, doc_id):
         doc = self.db.one('SELECT * FROM documents WHERE id=?', (doc_id,))
         if not doc:
             raise AppError(404, 'document_not_found', 'That document was not found.')
+        if doc['state'] == 'deleting':
+            raise AppError(404, 'document_not_found', 'That document was deleted.')
         doc['tags'] = json.loads(doc['tags'])
         return doc
 
     def embed(self, texts, kind):
-        vectors = [None] * len(texts)
+        if not texts:
+            return []
+        keys = [hashlib.sha256((self.model_key + ':' + kind + ':' + text).encode()).hexdigest() for text in texts]
+        with self.db.session():
+            rows = self.db.all('SELECT key,vector FROM embeddings WHERE key IN (' + ','.join('?' for _ in set(keys)) + ')', tuple(set(keys)))
+        cached = {r['key']:json.loads(r['vector']) for r in rows}
+        vectors = [cached.get(key) for key in keys]
         missing = {}
-        for i, text in enumerate(texts):
-            key = hashlib.sha256((self.model_key + ':' + kind + ':' + text).encode()).hexdigest()
-            cached = self.db.cached(key)
-            if cached is not None:
-                vectors[i] = cached
-                self.db.count(kind + '_cache_hits')
-            else:
-                missing.setdefault(key, {'text': text, 'indices': []})['indices'].append(i)
+        for index, (key, text) in enumerate(zip(keys, texts)):
+            if key not in cached:
+                missing.setdefault(key, {'text':text, 'indices':[]})['indices'].append(index)
         items = list(missing.items())
         for offset in range(0, len(items), 64):
             batch = items[offset:offset+64]
             generated = self.provider.embed([item['text'] for _, item in batch])
             if len(generated) != len(batch):
                 raise AppError(502, 'invalid_embeddings', 'The AI service returned incomplete embeddings.')
+            args = []
             for (key, item), vector in zip(batch, generated):
-                self.db.execute('INSERT OR REPLACE INTO embeddings VALUES (?,?,?)', (key, kind, json.dumps(vector)))
-                self.db.count(kind + '_embeddings_generated')
+                args.extend((key, kind, json.dumps(vector)))
                 for index in item['indices']:
                     vectors[index] = vector
-                if len(item['indices']) > 1:
-                    self.db.count(kind + '_cache_hits', len(item['indices'])-1)
-        log.info('embedding kind=%s requested=%d generated=%d reused=%d', kind, len(texts), len(items), len(texts)-len(items))
+            with self.db.session():
+                self.db.execute('INSERT INTO embeddings VALUES ' + ','.join('(?,?,?)' for _ in batch) + ' ON CONFLICT(key) DO UPDATE SET vector=excluded.vector', args)
+                self.db.count(kind + '_embeddings_generated', len(batch))
+        hits = len(texts)-len(items)
+        if hits:
+            self.db.count(kind + '_cache_hits', hits)
+        log.info('embedding kind=%s requested=%d generated=%d reused=%d', kind, len(texts), len(items), hits)
         return vectors
 
     def enqueue(self, doc_id):
         if self.settings.provider != 'fake' and not self.settings.api_key:
             raise AppError(503, 'missing_model_key', f'Set {self.settings.key_variable} on the backend before indexing documents.')
-        if self.db.one("SELECT id FROM jobs WHERE document_id=? AND state IN ('queued','indexing')", (doc_id,)):
-            raise AppError(409, 'indexing_conflict', 'This document already has an indexing job.')
         with self.lock:
-            self.document(doc_id)
-            if self.db.one("SELECT id FROM jobs WHERE document_id=? AND state IN ('queued','indexing')", (doc_id,)):
-                raise AppError(409, 'indexing_conflict', 'This document already has an indexing job.')
-            job_id = uid()
-            self.db.execute('INSERT INTO jobs (id,document_id,state,created_at) VALUES (?,?,?,?)',
-                            (job_id, doc_id, 'queued', now()))
-            self.jobs.put(job_id)
+            doc = self.document(doc_id)
+            if doc['state'] == 'deleting':
+                raise AppError(409, 'document_deleting', 'Retry deleting this document.')
+            # Acquiring the global DB lock proves earlier indexing transactions have ended.
+            # Persist status on a separate connection so platform termination leaves a retryable job.
+            with self.db.session(detached=True):
+                self.db.execute("UPDATE jobs SET state='failed',error='Interrupted; retry indexing.' WHERE document_id=? AND state IN ('queued','indexing')", (doc_id,))
+                job_id = uid()
+                self.db.execute('INSERT INTO jobs (id,document_id,state,created_at) VALUES (?,?,?,?)', (job_id, doc_id, 'indexing', now()))
+                self.db.execute("UPDATE documents SET state='indexing',error=NULL WHERE id=?", (doc_id,))
+            self.index(job_id)
             return self.db.one('SELECT * FROM jobs WHERE id=?', (job_id,))
-
-    def run_worker(self):
-        while True:
-            job_id = self.jobs.get()
-            try:
-                if job_id is None:
-                    return
-                self.index(job_id)
-            except Exception:
-                log.exception('Unexpected indexing worker failure')
-            finally:
-                self.jobs.task_done()
 
     def index(self, job_id):
         started = time.perf_counter()
@@ -118,30 +101,30 @@ class Service:
             return
         try:
             with self.lock:
-                doc = self.document(job['document_id'])
-                self.db.execute("UPDATE jobs SET state='indexing' WHERE id=?", (job_id,))
-                self.db.execute("UPDATE documents SET state='indexing',error=NULL WHERE id=?", (doc['id'],))
-                fingerprint = hashlib.sha256((self.model_key + ':chunk-v1:' + doc['text']).encode()).hexdigest()
-                parts = chunks(doc['text'], doc['filename'].lower().endswith('.pdf'))
-                if not parts:
-                    raise AppError(422, 'empty_file', 'The document contains no searchable text.')
-                existing = self.collection.get(where={'document_id': doc['id']})
-                if doc['indexed_hash'] == fingerprint and len(existing['ids']) == len(parts):
-                    self.db.count('document_cache_hits', len(parts))
-                    self.db.count('unchanged_documents_skipped')
-                else:
-                    vectors = self.embed([p['snippet'] for p in parts], 'document')
-                    # Chroma and SQLite cannot share a transaction. Documents stay unsearchable
-                    # until replacement completes; failed/interrupted jobs can safely retry.
-                    self.collection.delete(where={'document_id': doc['id']})
-                    self.collection.upsert(
-                        ids=[doc['id'] + '-' + str(i) for i in range(len(parts))],
-                        embeddings=vectors, documents=[p['snippet'] for p in parts],
-                        metadatas=[{'document_id': doc['id'], 'section': p['section'], 'page': p['page']} for p in parts])
-                self.db.execute("UPDATE documents SET state='ready',indexed_hash=?,error=NULL WHERE id=?", (fingerprint, doc['id']))
-                elapsed = (time.perf_counter()-started)*1000
-                self.db.execute("UPDATE jobs SET state='complete',chunks=?,elapsed_ms=?,error=NULL WHERE id=?", (len(parts), elapsed, job_id))
-                log.info('index_complete job=%s chunks=%d elapsed_ms=%.2f', job_id, len(parts), elapsed)
+                with self.db.savepoint():
+                    doc = self.document(job['document_id'])
+                    self.db.execute("UPDATE jobs SET state='indexing' WHERE id=?", (job_id,))
+                    self.db.execute("UPDATE documents SET state='indexing',error=NULL WHERE id=?", (doc['id'],))
+                    fingerprint = hashlib.sha256((self.model_key + ':char-v2:' + doc['text']).encode()).hexdigest()
+                    parts = chunks(doc['text'], doc['filename'].lower().endswith('.pdf'))
+                    if not parts:
+                        raise AppError(422, 'empty_file', 'The document contains no searchable text.')
+                    existing = self.collection.get(where={'document_id': doc['id']})
+                    if doc['indexed_hash'] == fingerprint and len(existing['ids']) == len(parts):
+                        self.db.count('document_cache_hits', len(parts))
+                        self.db.count('unchanged_documents_skipped')
+                    else:
+                        vectors = self.embed([p['snippet'] for p in parts], 'document')
+                        # PostgreSQL chunks and ready status commit atomically; deterministic IDs prevent duplicates.
+                        self.collection.delete(where={'document_id': doc['id']})
+                        self.collection.upsert(
+                            ids=[doc['id'] + '-' + str(i) for i in range(len(parts))],
+                            embeddings=vectors, documents=[p['snippet'] for p in parts],
+                            metadatas=[{'document_id': doc['id'], 'section': p['section'], 'page': p['page']} for p in parts])
+                    self.db.execute("UPDATE documents SET state='ready',indexed_hash=?,error=NULL WHERE id=?", (fingerprint, doc['id']))
+                    elapsed = (time.perf_counter()-started)*1000
+                    self.db.execute("UPDATE jobs SET state='complete',chunks=?,elapsed_ms=?,error=NULL WHERE id=?", (len(parts), elapsed, job_id))
+                    log.info('index_complete job=%s chunks=%d elapsed_ms=%.2f', job_id, len(parts), elapsed)
         except Exception as exc:
             code = exc.code if isinstance(exc, AppError) else 'indexing_failed'
             message = exc.message if isinstance(exc, AppError) else 'Indexing failed. Check the backend log and retry.'
@@ -156,7 +139,7 @@ class Service:
         if not question:
             raise AppError(422, 'empty_query', 'Enter a question first.')
         with self.lock:
-            docs = [self.document(d['id']) for d in self.db.all("SELECT id FROM documents WHERE state='ready'")]
+            docs = [{**d, 'tags':json.loads(d['tags'])} for d in self.db.all("SELECT id,filename,tags,category,state,revision,indexed_hash FROM documents WHERE state='ready'")]
             docs = [d for d in docs if (not category or d['category'] == category) and
                     (not tags or set(tags).issubset(d['tags']))]
             if not docs:

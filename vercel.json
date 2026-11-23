@@ -1,0 +1,19 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "regions": ["hnd1"],
+  "installCommand": "npm ci --prefix frontend",
+  "buildCommand": "npm run build --prefix frontend",
+  "outputDirectory": "frontend/dist",
+  "functions": {
+    "api/index.py": {
+      "maxDuration": 300,
+      "excludeFiles": "{.venv/**,venv/**,runtime/**,data/**,frontend/**,backend/tests/**,design-system/**,*.log}"
+    }
+  },
+  "routes": [
+    { "src": "/(api(?:/.*)?|health|metrics)", "dest": "/api/index.py" },
+    { "handle": "filesystem" },
+    { "src": "/.*", "dest": "/index.html" }
+  ]
+}

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, errorText, type User, type Doc, type Conversation } from "./api";
 import { Brand, Notice } from "./components/shared";
 import Icon from "./components/Icon";
@@ -15,56 +15,125 @@ export default function App() {
   const [docs, setDocs] = useState<Doc[]>([]);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [conversation, setConversation] = useState<string | null>(null);
+  const [newChatKey, setNewChatKey] = useState(0);
   const [error, setError] = useState("");
   const [fake, setFake] = useState(false);
-  const refreshDocs = useCallback(
-    async () => setDocs(await api<Doc[]>("/api/documents")),
-    [],
-  );
-  const refreshConversations = useCallback(
-    async () =>
-      setConversations(await api<Conversation[]>("/api/conversations")),
-    [],
-  );
-  const refreshUser = useCallback(() => {
-    void api<User>("/api/auth/me")
-      .then((u) => {
-        setUser(u);
-        if (u.role !== "admin") setPage("ask");
-      })
-      .catch(() => window.dispatchEvent(new Event("guidely-session-expired")));
-  }, []);
-  useEffect(() => {
-    api<User>("/api/auth/me")
-      .then(setUser)
-      .catch(() => {})
-      .finally(() => setBooting(false));
-    api<{ provider: string }>("/health")
-      .then((h) => setFake(h.provider === "fake"))
-      .catch(() => {});
-    const expired = () => {
-      setUser(null);
+  const [docsLoaded, setDocsLoaded] = useState(false);
+  const [docsLoading, setDocsLoading] = useState(false);
+  const [docsError, setDocsError] = useState("");
+  const generation = useRef(0);
+  const activeUser = useRef<string | null>(null);
+  const controllers = useRef(new Set<AbortController>());
+  const docsRequest = useRef<{ generation: number; promise: Promise<void> } | null>(null);
+  const activateUser = useCallback((next: User | null) => {
+    if (activeUser.current !== (next ? `${next.id}:${next.role}` : null)) {
+      generation.current += 1;
+      activeUser.current = next ? `${next.id}:${next.role}` : null;
+      controllers.current.forEach((controller) => controller.abort());
+      controllers.current.clear();
+      docsRequest.current = null;
       setDocs([]);
+      setDocsLoaded(false);
+      setDocsLoading(Boolean(next));
+      setDocsError("");
       setConversations([]);
       setConversation(null);
-    };
-    window.addEventListener("guidely-session-expired", expired);
-    return () => window.removeEventListener("guidely-session-expired", expired);
+      setError("");
+    }
+    setUser(next);
   }, []);
+  const refreshDocs = useCallback((forceFresh = false): Promise<void> => {
+    if (!activeUser.current) return Promise.resolve();
+    const requestedGeneration = generation.current;
+    if (docsRequest.current?.generation === requestedGeneration) {
+      const existing = docsRequest.current.promise;
+      if (!forceFresh) return existing;
+      // A mutation needs a snapshot started after it committed, not an older read.
+      return existing.catch(() => {}).then(() => {
+        if (generation.current === requestedGeneration) return refreshDocs();
+      });
+    }
+    const controller = new AbortController();
+    controllers.current.add(controller);
+    setDocsLoading(true);
+    setDocsError("");
+    const promise = api<Doc[]>("/api/documents", { signal: controller.signal })
+      .then((loaded) => {
+        if (generation.current === requestedGeneration) {
+          setDocs(loaded);
+          setDocsLoaded(true);
+        }
+      })
+      .catch((failure) => {
+        if (!controller.signal.aborted && generation.current === requestedGeneration) {
+          setDocsError(errorText(failure));
+          throw failure;
+        }
+      })
+      .finally(() => {
+        controllers.current.delete(controller);
+        if (generation.current === requestedGeneration) {
+          setDocsLoading(false);
+          docsRequest.current = null;
+        }
+      });
+    docsRequest.current = { generation: requestedGeneration, promise };
+    return promise;
+  }, []);
+  const refreshConversations = useCallback(async () => {
+    if (!activeUser.current) return;
+    const requestedGeneration = generation.current;
+    const controller = new AbortController();
+    controllers.current.add(controller);
+    try {
+      const loaded = await api<Conversation[]>("/api/conversations", { signal: controller.signal });
+      if (generation.current === requestedGeneration) setConversations(loaded);
+    } catch (failure) {
+      if (!controller.signal.aborted && generation.current === requestedGeneration) throw failure;
+    } finally {
+      controllers.current.delete(controller);
+    }
+  }, []);
+  const refreshUser = useCallback(() => {
+    const requestedGeneration = generation.current;
+    void api<User>("/api/auth/me")
+      .then((u) => {
+        if (generation.current !== requestedGeneration) return;
+        activateUser(u);
+        if (u.role !== "admin") setPage("ask");
+      })
+      .catch(() => {
+        if (generation.current === requestedGeneration) window.dispatchEvent(new Event("guidely-session-expired"));
+      });
+  }, [activateUser]);
+  useEffect(() => {
+    const controller = new AbortController();
+    let active = true;
+    api<User>("/api/auth/me", { signal: controller.signal })
+      .then((loaded) => { if (active) activateUser(loaded); })
+      .catch(() => {})
+      .finally(() => { if (active) setBooting(false); });
+    api<{ provider: string }>("/health", { signal: controller.signal })
+      .then((h) => { if (active) setFake(h.provider === "fake"); })
+      .catch(() => {});
+    const expired = () => activateUser(null);
+    window.addEventListener("guidely-session-expired", expired);
+    return () => {
+      active = false;
+      controller.abort();
+      window.removeEventListener("guidely-session-expired", expired);
+    };
+  }, [activateUser]);
   useEffect(() => {
     if (user) {
-      void Promise.all([refreshDocs(), refreshConversations()]).catch((e) =>
-        setError(errorText(e)),
-      );
+      void refreshDocs().catch(() => {});
+      void refreshConversations().catch((e) => setError(errorText(e)));
     }
   }, [user, refreshDocs, refreshConversations]);
   async function logout() {
     try {
       await api("/api/auth/logout", { method: "POST" });
-      setUser(null);
-      setDocs([]);
-      setConversations([]);
-      setConversation(null);
+      activateUser(null);
       setPage("ask");
     } catch (e) {
       setError(errorText(e));
@@ -90,7 +159,7 @@ export default function App() {
     return (
       <Login
         onLogin={(u) => {
-          setUser(u);
+          activateUser(u);
           setPage("ask");
           setError("");
         }}
@@ -114,6 +183,7 @@ export default function App() {
         <button
           className="new-question"
           onClick={() => {
+            setNewChatKey((previous) => previous + 1);
             setConversation(null);
             setPage("ask");
           }}
@@ -130,7 +200,7 @@ export default function App() {
             >
               <Icon name={icon} />
               {name}
-              {id === "documents" && <small>{docs.length}</small>}
+              {id === "documents" && <small>{docsLoaded ? docs.length : docsError ? "-" : "..."}</small>}
             </button>
           ))}
         </nav>
@@ -220,7 +290,10 @@ export default function App() {
         )}
         {page === "ask" && (
           <Ask
+            key={newChatKey}
             docs={docs}
+            docsLoaded={docsLoaded}
+            docsLoading={docsLoading}
             selectedConversation={conversation}
             onConversation={setConversation}
             onRefresh={() =>
@@ -232,6 +305,9 @@ export default function App() {
           <Documents
             docs={docs}
             refresh={refreshDocs}
+            loading={docsLoading}
+            loaded={docsLoaded}
+            loadError={docsError}
             admin={user.role === "admin"}
           />
         )}
