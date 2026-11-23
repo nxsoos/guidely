@@ -1,0 +1,10 @@
+fastapi==0.149.0
+uvicorn==0.54.0
+python-multipart==0.0.32
+python-dotenv==1.2.4
+openai==3.35.1
+chromadb==1.5.9
+pypdf==6.21.1
+tiktoken==0.9.0
+httpx==0.28.1
+pytest==8.3.5

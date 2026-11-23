@@ -1,0 +1,22 @@
+[
+  {"question":"How many holiday days do I get each year?","filename":"leave-policy.md","section":"Annual leave","expected":"25 paid working days"},
+  {"question":"How early should I ask for time off?","filename":"leave-policy.md","section":"Requesting time off","expected":"10 working days"},
+  {"question":"When is a doctor's note required?","filename":"leave-policy.md","section":"Sick leave","expected":"three or more consecutive working days"},
+  {"question":"Can I save unused holiday for next year?","filename":"leave-policy.md","section":"Carryover","expected":"five unused annual leave days"},
+  {"question":"When is the IT help desk open?","filename":"it-support.md","section":"Contacting support","expected":"Sunday through Thursday"},
+  {"question":"I forgot my login password. What should I do?","filename":"it-support.md","section":"Password recovery","expected":"Forgot password"},
+  {"question":"How can I get a replacement laptop?","filename":"it-support.md","section":"Laptop requests","expected":"Equipment Requests"},
+  {"question":"Who must approve my laptop request?","filename":"it-support.md","section":"Laptop requests","expected":"line manager"},
+  {"question":"When will I receive my onboarding welcome email?","filename":"onboarding.md","section":"Before your first day","expected":"three working days"},
+  {"question":"Where should I go on my first morning?","filename":"onboarding.md","section":"Your first morning","expected":"reception at 9:00 AM"},
+  {"question":"What training must new hires finish and by when?","filename":"onboarding.md","section":"Required training","expected":"first seven calendar days"},
+  {"question":"When should I have my first monthly check-in?","filename":"onboarding.md","section":"First month","expected":"30-day check-in"},
+  {"question":"How long do I have to claim a business purchase?","filename":"expenses.md","section":"Submitting a claim","expected":"30 calendar days"},
+  {"question":"What is the daily food allowance when travelling?","filename":"expenses.md","section":"Meals","expected":"150 SAR"},
+  {"question":"Can I book a business-class flight?","filename":"expenses.md","section":"Travel approval","expected":"economy class"},
+  {"question":"When will an approved expense be paid?","filename":"expenses.md","section":"Payment schedule","expected":"20th of the month"},
+  {"question":"Do company accounts require a second authentication factor?","filename":"security.md","section":"Account protection","expected":"multi-factor authentication"},
+  {"question":"What should I do with a phishing email?","filename":"security.md","section":"Suspicious messages","expected":"Report Phishing"},
+  {"question":"How soon must I report a stolen work phone?","filename":"security.md","section":"Lost devices","expected":"within one hour"},
+  {"question":"May I keep customer files in my personal cloud drive?","filename":"security.md","section":"Customer data","expected":"only in approved company systems"}
+]
